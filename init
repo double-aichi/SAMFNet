@@ -1,0 +1,126 @@
+import os
+from os.path import join
+import sys
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import tempfile
+import subprocess
+from main.config.AU_landmarks import AU_landmarks
+from main.openface.run_openface import run_openface
+
+from main.preprocess.au_crop import crop_au_by_points, crop_au_by_bbox
+from main.config.openface_au_map import AU_ORDER_23, MODEL_AU_TO_OPENFACE_R
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+
+DIR_DATA = r"E:\Pycharm_code\micro-expression\main\preprocess\databases"
+
+raw_dir=r"C:\dataset\CASME2\CASME2-RAW"
+
+OPENFACE_EXE = r"E:\Double-AICHI\Goodle download\OpenFace_2.2.0_win_x64\OpenFace_2.2.0_win_x64\FeatureExtraction.exe"
+
+def resize_with_padding(img, target_size=96):
+
+    h, w = img.shape[:2]
+
+    scale = target_size / max(h, w)
+
+    new_h = int(h * scale)
+    new_w = int(w * scale)
+
+    img_resized = cv2.resize(img, (new_w, new_h))
+
+    pad_h = target_size - new_h
+    pad_w = target_size - new_w
+
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+
+    img_padded = cv2.copyMakeBorder(
+        img_resized,
+        top,
+        bottom,
+        left,
+        right,
+        cv2.BORDER_CONSTANT,
+        value=[0,0,0]
+    )
+    return img_padded
+
+def data_init(dataset):
+    no_landmark = 0
+    data_folder = DIR_DATA + '\\' + dataset
+    data_info = pd.read_csv(data_folder + '/coding.csv')
+    # if not os.path.exists(data_folder + '/landmarks'):
+    #     os.makedirs(data_folder + '/landmarks')
+
+    no=0
+    num=0
+    ftype = '.jpg'
+    for idx, sample in data_info.iterrows():
+        ep = sample.Filename
+
+        # 5分类
+        if sample.Emotion in ["fear", "sadness"]:
+            no+=1
+            continue
+
+        sub = 'sub' + str(sample.Subject).zfill(2)
+        onset = 'img' + str(sample.OnsetFrame) + ftype
+        apex = 'img' + str(sample.ApexFrame) + ftype
+        offset = 'img' + str(sample.OffsetFrame) + ftype
+        img_folder_onset = raw_dir + '\\'+ sub + '\\' + ep + '\\' + onset
+        img_folder_apex = raw_dir  + '\\'+ sub + '\\' + ep + '\\' + apex
+        img_folder_offset = raw_dir  + '\\'+ sub + '\\' + ep + '\\' + offset
+
+
+        aligned_onset, aligned_apex,aligned_offset, landmarks_onset,landmarks_apex,landmarks_offset, au_intensity=run_openface(img_folder_onset,img_folder_apex,img_folder_offset)
+
+
+        aligned_frames_dir = os.path.join(data_folder, 'aligned_frames', sub, ep)
+        os.makedirs(aligned_frames_dir, exist_ok=True)
+
+        cv2.imwrite(os.path.join(aligned_frames_dir, 'onset.jpg'),aligned_onset)
+        cv2.imwrite(os.path.join(aligned_frames_dir, 'apex.jpg'), aligned_apex)
+        cv2.imwrite(os.path.join(aligned_frames_dir, 'offset.jpg'),aligned_offset)
+
+        aligned_frames_paths = {
+            'onset':  os.path.join(aligned_frames_dir, 'onset.jpg'),
+            'apex':   os.path.join(aligned_frames_dir, 'apex.jpg'),
+            'offset': os.path.join(aligned_frames_dir, 'offset.jpg'),
+        }
+
+        sample_data = {
+
+            'aligned_frames': aligned_frames_paths,  
+
+            'landmarks': {
+                'onset':  landmarks_onset,         
+                'apex':   landmarks_apex,
+                'offset': landmarks_offset,
+            },
+
+            # -------- AU 激活强度 --------
+            'au_intensity': au_intensity,              
+
+            'subject':  sub,
+            'video_id': ep,
+            'label':    sample.Emotion,
+        }
+
+        save_path = os.path.join(data_folder, 'samples', sub, f"{ep}.pt")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save(sample_data, save_path)
+        print(f"样本已保存: {save_path}")
+        num+=1
+        # 保存结束
+    print(f"no_landmark num：{no_landmark}")
+    print(f"总数：{num}")
+    print(f"过滤：{no}")
+if __name__ == '__main__':
+    data_init('casme2')
