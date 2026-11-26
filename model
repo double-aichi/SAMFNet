@@ -1,0 +1,273 @@
+import torch
+from torch import nn
+from torchvision import models
+import torch.nn.functional as F
+
+
+
+class AUVisualEncoder(nn.Module):
+
+    def __init__(self, out_dim=512):
+        super().__init__()
+        self.conv1 = nn.Conv2d(9, 64, 3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False)
+        self.bn3   = nn.BatchNorm2d(256)
+
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(256, 16, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 256, bias=False),
+            nn.Sigmoid()
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(256, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2)
+        )
+
+    def forward(self, x):
+        onset = x[:, 0]          
+        apex  = x[:, 1]         
+        diff  = apex - onset      
+
+        x = torch.cat([onset, apex, diff], dim=1)   
+        x = F.relu(self.bn1(self.conv1(x)))        
+        x = F.relu(self.bn2(self.conv2(x)))         
+        x = F.relu(self.bn3(self.conv3(x)))         
+
+        se_w = self.se(x).unsqueeze(-1).unsqueeze(-1)
+        x = x * se_w
+
+        x = self.pool(x).view(x.size(0), -1)   
+        return self.fc(x)                         
+
+class AUCrossModalAlign(nn.Module):
+    def __init__(self, dim=512, text_dim=256,temperature=0.07):
+        super().__init__()
+        self.dim = dim
+        self.temperature = temperature
+
+        self.text_proj = nn.Linear(text_dim, dim)
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+
+        self.gamma = nn.Parameter(torch.tensor(0.1))
+
+        self.visual_norm = nn.LayerNorm(dim)
+        self.text_norm   = nn.LayerNorm(dim)
+
+    def forward(self, visual_feat, text_feat, au_intensity):
+        B, N, D = visual_feat.shape
+
+        text_feat = self.text_proj(text_feat)
+
+        # text_feat = text_feat.unsqueeze(0).expand(B, -1, -1)
+        text_feat = text_feat.unsqueeze(0).expand(B, -1, -1) 
+
+
+        norm_intensity = au_intensity / (au_intensity.max(dim=1, keepdim=True)[0] + 1e-6)
+        weight = torch.sigmoid(norm_intensity * 5 - 2.5) 
+
+        Q = self.q_proj(visual_feat)
+        K = self.k_proj(text_feat) 
+        V = self.v_proj(text_feat)
+
+        attn = torch.matmul(Q, K.transpose(-1, -2)) / (D ** 0.5) 
+        attn = attn + weight.unsqueeze(1)   
+        attn = F.softmax(attn, dim=-1)
+
+        cross_feat = torch.matmul(attn, V)
+
+        fused_feat = visual_feat + self.gamma * cross_feat * weight.unsqueeze(-1)
+        fused_feat = self.visual_norm(fused_feat)
+
+        v_norm = F.normalize(visual_feat, dim=-1)
+        t_norm = F.normalize(text_feat, dim=-1)
+        sim = torch.matmul(v_norm, t_norm.transpose(-1, -2)) / self.temperature
+
+        loss = 0
+        count = 0
+        for b in range(B):
+            w = weight[b]
+            valid = w > 0.15
+            idx = valid.nonzero(as_tuple=True)[0]
+            if len(idx) < 2:
+                continue
+            sim_sub = sim[b][idx][:, idx]
+            labels = torch.arange(len(idx), device=visual_feat.device)
+            ce = F.cross_entropy(sim_sub, labels, reduction='none')
+            loss += (ce * w[idx]).mean()
+            count += 1
+
+        loss = loss / count if count > 0 else None
+
+        return fused_feat, loss, attn, weight
+
+
+class StandardCBAMBlock(nn.Module):
+
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.shared_mlp = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, bias=False),
+        )
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        avg_out = self.shared_mlp(self.avg_pool(x))
+        max_out = self.shared_mlp(self.max_pool(x))
+        channel_attn = torch.sigmoid(avg_out + max_out)
+        x = x * channel_attn
+
+        max_s, _ = torch.max(x, dim=1, keepdim=True)
+        avg_s = torch.mean(x, dim=1, keepdim=True)
+        x = x * self.spatial_attn(torch.cat([max_s, avg_s], dim=1))
+        return x
+
+class CBAMBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.channel_attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channel, channel // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, bias=False),
+            nn.Sigmoid()
+        )
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = x * self.channel_attn(x)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        x = x * self.spatial_attn(torch.cat([max_out, avg_out], dim=1))
+        return x
+
+
+class FlowEncoderUltimate(nn.Module):
+    def __init__(self, out_dim=512):
+        super().__init__()
+        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        self.cbam = CBAMBlock(512)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(512, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        feat = self.cbam(feat)
+        feat = self.global_pool(feat).view(feat.size(0), -1)
+        return self.fc(feat)
+
+
+class GlobalLocalFusion(nn.Module):
+    def __init__(self, dim=512, num_heads=4):
+        super().__init__()
+        self.dim = dim
+
+        # Pre-attention LayerNorm
+        self.ln_q  = nn.LayerNorm(dim)
+        self.ln_kv = nn.LayerNorm(dim)
+
+        # MultiheadAttention
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2, 1),
+            nn.Sigmoid()
+        )
+
+        self.ln = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(dim * 2, dim),
+            nn.Dropout(0.2)
+        )
+
+    def forward(self, fused_au_feats, flow_feat):
+       
+        q_in  = self.ln_q(flow_feat).unsqueeze(1)  
+        kv_in = self.ln_kv(fused_au_feats)          
+
+        attn_out, _ = self.multihead_attn(q_in, kv_in, kv_in)
+        attn_out = attn_out.squeeze(1)              
+
+        combined   = torch.cat([flow_feat, attn_out], dim=-1) 
+        g          = self.gate(combined)                      
+        mixed_feat = self.fusion_layer(combined)                
+
+       
+        x = self.ln(flow_feat * (1 - g) + mixed_feat * g)
+
+        x = x + self.ffn(x)
+        return x 
+
+
+class MyModel(nn.Module):
+    def __init__(self, num_classes=5):
+        super().__init__()
+
+        self.au_encoder        = AUVisualEncoder()
+        self.au_text_fusion    = AUCrossModalAlign()
+        self.flow_encoder      = FlowEncoderUltimate()
+        self.GlobalLocalFusion = GlobalLocalFusion(dim=512, num_heads=4)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, au, flow, intensity, text_feat):
+      
+        B, N, T, C, H, W = au.shape
+
+        au      = au.view(B * N, T, C, H, W)
+        au_feat = self.au_encoder(au)         
+        au_feat = au_feat.view(B, N, -1)   
+
+        fused_au, contrast_loss, attn, weight = self.au_text_fusion(au_feat, text_feat, intensity)
+
+        flow_feat = self.flow_encoder(flow)  
+
+        fused = self.GlobalLocalFusion(fused_au, flow_feat)  
+
+        out = self.classifier(fused)
+
+        return out, contrast_loss, attn, au_feat, fused_au
