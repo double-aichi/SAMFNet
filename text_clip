@@ -1,0 +1,73 @@
+import clip
+from torch import nn
+import torch
+import os
+from main.config.AU_text import AU_TEXT
+
+# import clip
+# print(clip)
+# print(hasattr(clip, "load"))
+
+torch.manual_seed(42)
+class AUTextEncoder(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+        self.clip_model, _ = clip.load("ViT-B/32", device=device)
+        self.clip_model.eval()
+
+
+        for p in self.clip_model.parameters():
+            p.requires_grad = False
+
+        self.text_proj = nn.Linear(
+            512,
+            256,
+            bias=False
+        ).to(device)
+
+        for p in self.text_proj.parameters():
+            p.requires_grad = False
+
+    @torch.no_grad()
+    def forward(self, text_list):
+        """
+        text_list: List[str]  e.g. ["left inner brow raiser"]
+        return: (B, 256)  
+        """
+        tokens = clip.tokenize(text_list).to(self.device)
+        text_feat = self.clip_model.encode_text(tokens)
+        text_feat = text_feat.float()
+        text_feat = self.text_proj(text_feat)
+        text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+        return text_feat
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+SAVE_PATH = os.path.join(PROJECT_ROOT, "main", "multimodal", "text", "text_coding.pt")
+
+
+def encode_and_save_au_text(device):
+    encoder = AUTextEncoder(device=device)
+    encoder.eval()
+
+    au_names = list(AU_TEXT.keys())
+    au_texts = [AU_TEXT[k] for k in au_names]
+
+    with torch.no_grad():
+        text_feats = encoder(au_texts)   # (14, 512)
+
+    save_dict = {
+        "au_names": au_names,
+        "text_feats": text_feats.cpu()   
+    }
+
+    os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+    torch.save(save_dict, SAVE_PATH)
+
+    print(f"[✓] AU text features saved to {SAVE_PATH}")
+    print("Shape:", text_feats.shape)
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    encode_and_save_au_text(device)
